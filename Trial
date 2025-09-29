@@ -1,0 +1,202 @@
+from datetime import datetime, timedelta
+from functools import partial
+import os
+import sys
+import yaml
+
+from airflow import DAG
+from airflow.operators.dummy import DummyOperator
+from airflow.models import TaskInstance
+from airflow.exceptions import AirflowException
+from airflow.operators.python import PythonOperator
+
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
+from google.cloud import bigquery
+
+# ==== paths/modules (kept for outage_line) ====
+BASE_DIR = "/home/airflow/gcs/dags/vz-it-gudv-dtwndo-0"
+sys.path.append(f"{BASE_DIR}/outage_line/python")
+
+from DO_utils import publishLog, create_do_dict
+
+# ==== config load (kept as-is for outage_line) ====
+project = os.environ['GCP_PROJECT']
+with open(f"{BASE_DIR}/outage_line/config/base_config.yml", 'r') as file:
+    base_config = yaml.full_load(file)
+
+with open(f"{BASE_DIR}/outage_line/config/gudv_outage_line.yml", 'r') as file:
+    dag_config = yaml.full_load(file)
+
+config_values = {}
+filtered_base_dict = dict(filter(lambda elem: elem[0] == project, base_config.items()))
+filtered_dict = dict(filter(lambda elem: elem[0] == project, dag_config.items()))
+
+if len(filtered_base_dict) > 0:
+    base_value = filtered_base_dict[project][0]
+    config_values = {**config_values, **base_value}
+else:
+    print("No config found exiting...")
+    sys.exit(-1)
+
+if len(filtered_dict) > 0:
+    app_value = filtered_dict[project][0]
+    config_values = {**config_values, **app_value}
+else:
+    print("No config found exiting...")
+    sys.exit(-1)
+
+# ==== variables (kept; only using the ones this pattern needs) ====
+GCP_PROJECT_ID = config_values['gcp_project']
+bq_connection_id = config_values['google_cloud_conn_id']
+region = config_values['region']
+DAG_ID = config_values['dag_id']
+base_directory = config_values['base_directory']
+env = config_values['env']
+dataset_id = config_values['dataset_id']
+stored_proc = config_values['stored_proc']
+table_name = config_values['table_name']
+schedule_interval = config_values['schedule_interval']
+failure_email_alert_distro = config_values['failure_email_alert_distro']
+
+# These two must exist in your outage_line config (same keys used by the 2nd pattern)
+gcs_bucket_location = config_values['gcs_bucket_location']
+bucket_path = config_values['bucket_path']
+
+# Optional priority if you want to control BQ job priority (NORMAL/INTERACTIVE/BATCH)
+priority = config_values.get('priority', 'INTERACTIVE')
+
+do_dict = create_do_dict(config_values)
+
+# ==== default_args (kept from your first DAG) ====
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(year=2025, month=4, day=30, hour=9, minute=0),
+    'email': [failure_email_alert_distro],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=3)
+}
+
+dag = DAG(
+    dag_id=DAG_ID,
+    schedule_interval=schedule_interval,
+    catchup=True,
+    default_args=default_args,
+    description='This DAG calls Stored Procedure (outage_line) after verifying 5-minute arrivals',
+    concurrency=int(config_values['concurrency']),
+    max_active_runs=int(config_values['max_active_runs']),
+    tags=["dtwin","nw_research_assistant","network_genie","outage_line","auto_bi"]
+)
+
+start = DummyOperator(
+    task_id='start',
+    dag=dag,
+    on_success_callback=partial(publishLog, "PROGRESS", do_dict),
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict)
+)
+
+# ==== 5-minute GCS sensors (00,05,...,55) — pattern from script #2 ====
+sensors = []
+for i in range(0, 60, 5):
+    task_id = f'check_success_file_{i:02d}min'
+    # Expect: gs://<bucket>/<bucket_path>/arrival=YYYYMMDDHHMM/_SUCCESS
+    prefix = bucket_path + f"/arrival={{{{ data_interval_end.strftime('%Y%m%d%H') }}}}{i:02d}/_SUCCESS"
+
+    sensor = GCSObjectsWithPrefixExistenceSensor(
+        dag=dag,
+        task_id=task_id,
+        bucket=gcs_bucket_location,
+        prefix=prefix,
+        mode='reschedule',
+        poke_interval=300,     # 5 minutes
+        timeout=7200,          # 2 hours
+        soft_fail=True,        # consolidate below
+        google_cloud_conn_id=bq_connection_id,
+        on_failure_callback=partial(publishLog, "FAILURE", do_dict)
+    )
+    sensors.append(sensor)
+
+# ==== consolidated status check (pattern from script #2) ====
+def check_all_file_statuses(**context):
+    """
+    Consolidates the statuses of the 12 GCS sensors (every 5 minutes within the current hour).
+    Raises a single AirflowException if ANY _SUCCESS marker is missing.
+    """
+    process_date = context['data_interval_end'].strftime("%Y-%m-%d %H:%M:%S")
+    trans_date = context['data_interval_end'].strftime("%Y-%m-%d")
+
+    ti = context['ti']
+    ti.xcom_push(key="process_date", value=process_date)
+    ti.xcom_push(key="trans_date", value=trans_date)
+
+    failed_checks = []
+    for i in range(0, 60, 5):
+        sensor_task_id = f'check_success_file_{i:02d}min'
+        arrival_time_str = context['data_interval_end'].strftime('%Y%m%d%H') + f'{i:02d}'
+
+        state = TaskInstance(context['dag'].get_task(sensor_task_id), context['logical_date']).current_state()
+        if state != 'success':
+            failed_checks.append(
+                f"-> No Success Marker for minute {i:02d}. "
+                f"Path: gs://{gcs_bucket_location}/{bucket_path}/arrival={arrival_time_str}/_SUCCESS"
+            )
+
+    if failed_checks:
+        error_details = "\n\n".join(failed_checks)
+        raise AirflowException(f"""Airflow exception -> Missing data to run Outage Line process
+
+{error_details}
+
+Please verify data load in 5-minute Source files.
+Environment  : {env.upper()}
+Process_Name : Outage Line Hourly
+trans_date   : {trans_date}
+process_dt   : {process_date}""")
+
+consolidated_status_check = PythonOperator(
+    dag=dag,
+    task_id="consolidated_status_check",
+    python_callable=check_all_file_statuses,
+    provide_context=True,
+    trigger_rule="all_done",
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict)
+)
+
+# ==== stored proc call via PythonOperator (pattern from script #2), 2 params kept ====
+def run_outage_line_sp(**kwargs):
+    bq_hook = BigQueryHook(gcp_conn_id=bq_connection_id)
+    client = bigquery.Client(project=GCP_PROJECT_ID, credentials=bq_hook.get_credentials())
+
+    process_date = kwargs['data_interval_end'].strftime("%Y-%m-%d %H:%M:%S")
+    trans_date = kwargs['data_interval_end'].strftime("%Y-%m-%d")
+
+    sp = f"""CALL {dataset_id}.{stored_proc}('{trans_date}','{process_date}')"""
+    print(f"Running stored proc: {sp}")
+
+    job_config = bigquery.QueryJobConfig(priority=priority)
+    job = client.query(sp, job_config=job_config)
+    job.result()
+
+call_outage_line_sp = PythonOperator(
+    dag=dag,
+    task_id="call_outage_line_sp",
+    python_callable=run_outage_line_sp,
+    provide_context=True,
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict)
+)
+
+end = DummyOperator(
+    task_id='end',
+    dag=dag,
+    trigger_rule='all_done',
+    on_success_callback=partial(publishLog, "SUCCESS", do_dict),
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict)
+)
+
+# ==== dependencies (pattern from script #2) ====
+start >> sensors
+consolidated_status_check.set_upstream(sensors)
+consolidated_status_check >> call_outage_line_sp >> end
