@@ -1,0 +1,215 @@
+from datetime import datetime, timedelta
+from functools import partial
+import os
+import sys
+import yaml
+from airflow import DAG, AirflowException
+from google.cloud import bigquery
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
+from airflow.operators.dummy import DummyOperator
+from airflow.operators.python import PythonOperator
+from airflow.models import TaskInstance
+from dateutil.relativedelta import relativedelta 
+
+# Load configuration
+BASE_DIR = "/home/airflow/gcs/dags/vz-it-gudv-dtwndo-0"
+sys.path.append(f"{BASE_DIR}/outage_site/python")
+
+from DO_utils import publishLog, create_do_dict  
+
+project = os.environ['GCP_PROJECT']
+with open(f"{BASE_DIR}/outage_site/config/base_config.yml", 'r') as file:
+    base_config = yaml.full_load(file)
+
+with open(f"{BASE_DIR}/outage_site/config/gudv_outage_site_hourly.yml", 'r') as file:
+    dag_config = yaml.full_load(file)
+
+config_values = {}
+filtered_base_dict = dict(filter(lambda elem: elem[0] == project, base_config.items()))
+filtered_dict = dict(filter(lambda elem: elem[0] == project, dag_config.items()))
+
+if len(filtered_base_dict) > 0:
+    base_value = filtered_base_dict[project][0]
+    config_values = {**config_values, **base_value}
+else:
+    print("No config found exiting...")
+    sys.exit(-1)
+
+if len(filtered_dict) > 0:
+    app_value = filtered_dict[project][0]
+    config_values = {**config_values, **app_value}
+else:
+    print("No config found exiting...")
+    sys.exit(-1)
+
+# Extract configuration values
+GCP_PROJECT_ID = config_values['gcp_project']
+bq_connection_id = config_values['google_cloud_conn_id']
+region = config_values['region']
+DAG_ID = config_values['dag_id']
+schedule_interval = config_values['schedule_interval']
+failure_email_alert_distro = config_values['failure_email_alert_distro']
+priority = config_values['priority']
+gcs_bucket_location = config_values['gcs_bucket_location']
+bucket_path = config_values['bucket_path']
+bucket_path2 = config_values['bucket_path2']   # Added for second bucket
+dataset_id = config_values['dataset_id']
+stored_proc = config_values['stored_proc']
+
+process_date = '{{ data_interval_end.strftime("%Y-%m-%d") }}'
+
+# Default arguments
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(year=2025, month=9, day=28, hour=9, minute=0),
+    'email': [failure_email_alert_distro],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=3),
+}
+
+# DAG definition
+dag = DAG(
+    dag_id=DAG_ID,
+    schedule_interval=schedule_interval,
+    catchup=True,
+    default_args=default_args,
+    description='This DAG calls a Stored Procedure after checking success markers from two buckets',
+    concurrency=int(config_values['concurrency']),
+    max_active_runs=int(config_values['max_active_runs']),
+    tags=["dtwin", "nw_research_assistant", "network_genie", "outage_site_hourly", "auto_bi"],
+)
+
+# Utility functions
+def check_all_file_statuses(**kwargs):
+    context = kwargs
+    process_date = context['data_interval_end'].strftime("%Y-%m-%d %H:%M:%S")
+    trans_date = context['data_interval_end'].strftime("%Y-%m-%d")
+    ti = context['ti']
+    ti.xcom_push(key="process_date", value=process_date)
+    ti.xcom_push(key="trans_date", value=trans_date)
+
+    failed_checks = []
+
+    # Check for both bucket_path and bucket_path2
+    for bucket, label in [(bucket_path, "bucket1"), (bucket_path2, "bucket2")]:
+        for i in range(0, 60, 5):
+            sensor_task_id = f'check_success_file_{label}_{i:02d}min'
+            arrival_time_str = (context['data_interval_start'] + timedelta(minutes=i)).strftime('%Y%m%d%H%M')
+
+            task_status = (TaskInstance(context['dag'].get_task(sensor_task_id), context['logical_date'])).current_state()
+            if task_status != 'success':
+                failed_checks.append(
+                    f"-> No Success Marker for {label}, minute {i:02d}. Path: gs://{gcs_bucket_location}/{bucket}/arrival={arrival_time_str}/_SUCCESS"
+                )
+
+    if failed_checks:
+        error_details = "\n\n".join(failed_checks)
+        raise AirflowException(f"""Airflow exception raised here -> Missing data to run outage site process\n
+            {error_details}\n\n
+            Please verify data load in outage site 5 mins Source Table.\n
+            Process_Name : outage site Hourly data\n
+            trans_date   : {trans_date}\n
+            process_dt   : {process_date}""")
+    else:
+        print("All success markers found for both buckets. Proceeding to stored procedure call.")
+
+def run_outage_hourly_sp(**kwargs):
+    bq_hook = BigQueryHook(gcp_conn_id=bq_connection_id, use_legacy_sql=False)
+    client = bigquery.Client(project=GCP_PROJECT_ID, credentials=bq_hook.get_credentials())
+    process_date = kwargs['data_interval_end'].strftime("%Y-%m-%d %H:%M:%S")
+    trans_date = kwargs['data_interval_end'].strftime("%Y-%m-%d")
+    sp = f"""CALL {dataset_id}.{stored_proc}('{trans_date}','{process_date}')"""
+    job_config = bigquery.QueryJobConfig(priority=priority)
+    query_job = client.query(sp, job_config=job_config)
+    query_job.result()
+
+# Tasks
+do_dict = create_do_dict(config_values)
+
+start = DummyOperator(
+    task_id='start',
+    dag=dag,
+    on_success_callback=partial(publishLog, "PROGRESS", do_dict),
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict),
+)
+
+sensors = []
+sensors2 = []
+
+# Sensors for bucket1
+for i in range(0, 60, 5):
+    task_id = f'check_success_file_bucket1_{i:02d}min'
+    prefix = bucket_path + f"/arrival={{{{ (data_interval_start + macros.timedelta(minutes={i})).strftime('%Y%m%d%H%M') }}}}/_SUCCESS"
+
+    sensor = GCSObjectsWithPrefixExistenceSensor(
+        dag=dag,
+        task_id=task_id,
+        bucket=gcs_bucket_location,
+        prefix=prefix,
+        mode='reschedule',
+        poke_interval=120,
+        timeout=1800,
+        soft_fail=True,
+        google_cloud_conn_id=bq_connection_id,
+    )
+    sensors.append(sensor)
+
+# Sensors for bucket2
+for i in range(0, 60, 5):
+    task_id = f'check_success_file_bucket2_{i:02d}min'
+    prefix = bucket_path2 + f"/arrival={{{{ (data_interval_start + macros.timedelta(minutes={i})).strftime('%Y%m%d%H%M') }}}}/_SUCCESS"
+
+    sensor2 = GCSObjectsWithPrefixExistenceSensor(
+        dag=dag,
+        task_id=task_id,
+        bucket=gcs_bucket_location,
+        prefix=prefix,
+        mode='reschedule',
+        poke_interval=120,
+        timeout=1800,
+        soft_fail=True,
+        google_cloud_conn_id=bq_connection_id,
+    )
+    sensors2.append(sensor2)
+
+consolidated_status_check = PythonOperator(
+    dag=dag,
+    task_id="consolidated_status_check",
+    python_callable=check_all_file_statuses,
+    trigger_rule="all_done",
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict),
+)
+
+call_outage_site_hourly_sp = BigQueryInsertJobOperator(
+    task_id="call_outage_site_hourly_sp",
+    dag=dag,
+    gcp_conn_id=bq_connection_id,
+    configuration={
+        "query": {
+            "query": f"CALL {dataset_id}.{stored_proc}('{trans_date}','{process_date}')",
+            "useLegacySql": False,
+        }
+    },
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict),
+)
+
+end = DummyOperator(
+    task_id='end',
+    dag=dag,
+    on_success_callback=partial(publishLog, "SUCCESS", do_dict),
+    on_failure_callback=partial(publishLog, "FAILURE", do_dict),
+)
+
+# Dependencies
+start >> sensors
+start >> sensors2
+
+sensors >> consolidated_status_check
+sensors2 >> consolidated_status_check
+
+consolidated_status_check >> call_outage_site_hourly_sp >> end
