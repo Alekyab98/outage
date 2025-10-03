@@ -1,0 +1,45 @@
+Declare process_ts TIMESTAMP DEFAULT TIMESTAMP('2025-10-01 19:00:00 UTC');
+select distinct safe_cast(substr(cast(arrival as string),9,2) as int64),extract(hour from process_ts at TIME ZONE "UTC"),count(*) from (
+SELECT DISTINCT
+    r.trans_dt,
+    m.event_id,
+    m.mdn,
+    m.event_category,
+    m.event_type,
+    m.status_name,
+    m.event_customer_status,
+    m.event_sub_type,
+    m.got_service,
+    m.connection_before_impact,
+    r.outage_type,
+    safe.PARSE_DATE('%Y%m%d',LEFT(r.start_time, 8)) AS start_time,
+    safe.PARSE_DATE('%Y%m%d',LEFT(r.resolution_time, 8)) AS resolved_time,
+    r.state,
+    r.city,
+    r.zip,
+    r.num_of_sites,
+    r.area_impacted,
+    r.active_mdn_cnt,
+    r.reason_etrext, ncs,
+    r.associated_planned_events,
+    r.oct_outage_id,
+    r.echo_id,
+    r.milestone_update,
+    r.arrival,
+    SAFE_CAST('2025-10-01' AS DATE) AS process_dt,
+    process_ts as schedule_time,
+    cast(current_timestamp as timestamp) as created_timestamp
+    FROM vz-it-pr-i37v-ndldo-0.vzn_ndl_nsp_core_tbls_prot_v.stp_ivr_outages_raw_v2 r
+    JOIN vz-it-pr-i37v-ndldo-0.vzn_ndl_nsp_core_tbls_prot_v.stp_ivr_outage_mdns_raw_v2 m
+    ON cast(r.event_id as numeric) = m.event_id
+    AND PARSE_DATE('%Y%m%d',LEFT(r.start_time, 8)) BETWEEN DATE_SUB(safe_cast(process_ts as DATE), INTERVAL 30 DAY) AND DATE_ADD(safe_cast(process_ts  as DATE), INTERVAL 30 DAY)
+
+WHERE safe_cast(substr(cast(arrival as string),9,2) as int64)=extract(hour from process_ts at TIME ZONE "UTC")
+--WHERE safe_cast(substr(cast(arrival as string),9,2) as int64) between 0 and 23
+and r.trans_dt =date(process_ts, "UTC")
+and m.trans_dt =date(process_ts, "UTC")
+
+    QUALIFY row_number() OVER (PARTITION BY m.mdn, r.event_id, r.start_time ORDER BY r.json_received_time DESC, m.json_received_time DESC, r.resolution_time DESC) = 1
+)group by all
+
+--select 925+29782+7982+14372+12592+6363+1895+3040+5897+8096+95017+154920+121620+89486+134112+135496+148477+128432+196005+115014+189732+72172+76571+32807
